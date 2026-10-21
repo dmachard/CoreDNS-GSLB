@@ -43,9 +43,9 @@ make lint
 If you need to update CoreDNS or its DNS dependency packages:
 
 ```bash
-go mod edit -go=1.25
-go get github.com/coredns/coredns@v1.14.7
-go get github.com/miekg/dns@v1.1.72
+go mod edit -go=1.26.0
+go get github.com/coredns/coredns@v1.15.0
+go get github.com/miekg/dns@v1.1.73
 go mod tidy
 ```
 
