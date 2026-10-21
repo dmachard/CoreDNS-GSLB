@@ -11,7 +11,7 @@ volumes:
 services:
   # Redis for shared health state
   redis:
-    image: redis:7.4-alpine
+    image: redis:8-alpine
     container_name: redis_redisha
     ports:
       - "6379:6379"

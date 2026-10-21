@@ -18,7 +18,7 @@ services:
 
   # Dedicated upstream DNS server for discovery integration tests
   coredns_discovery:
-    image: coredns/coredns:1.14.7
+    image: coredns/coredns:1.15.0
     container_name: coredns_discovery
     ports:
       - "8054:53/udp"
@@ -131,7 +131,7 @@ services:
         ipv4_address: 172.16.0.12
 
   prometheus:
-    image: prom/prometheus:v3.12.0
+    image: prom/prometheus:v3.13.4
     ports:
       - "9090:9090/tcp"
     volumes:
@@ -147,7 +147,7 @@ services:
         ipv4_address: 172.16.0.50
 
   grafana:
-    image: grafana/grafana:13.0.3
+    image: grafana/grafana:13.0
     ports:
       - "3000:3000/tcp"
     environment:
