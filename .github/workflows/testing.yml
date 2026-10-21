@@ -11,7 +11,7 @@ permissions:
   pull-requests: read  # for golangci/golangci-lint-action to fetch pull requests
 
 env:
-  GOLANGCI_LINT_VERSION: "v2.12.2"
+  GOLANGCI_LINT_VERSION: "v2.15.0"
   
 jobs:
   unit_tests:
