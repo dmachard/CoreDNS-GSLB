@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/coredns/coredns/plugin"
+	"github.com/coredns/coredns/plugin/pkg/nonwriter"
 	"github.com/miekg/dns"
 )
 
@@ -159,7 +160,7 @@ func (g *GSLB) handleIPRecord(ctx context.Context, w dns.ResponseWriter, r *dns.
 		return plugin.NextOrFailure(g.Name(), g.Next, ctx, w, r)
 	}
 	if !g.hasRecordTypeConfigured(record, recordType) {
-		return g.sendRcodeResponse(w, r, domain, dns.RcodeSuccess, true)
+		return g.sendNoDataResponse(ctx, w, r, domain)
 	}
 	ci := GetClientInfo(ctx)
 	if ci == nil || ci.IP == nil {
@@ -602,6 +603,61 @@ func (g *GSLB) sendRcodeResponse(w dns.ResponseWriter, r *dns.Msg, domain string
 	}
 	IncRecordResolutions(domain, "success")
 	return dns.RcodeSuccess, nil
+}
+
+// sendNoDataResponse answers a query for a record type the record does not have.
+// The answer is authoritative and carries the zone SOA (RFC 2308). It is not used
+// for fail-closed answers, which must not be negatively cached.
+func (g *GSLB) sendNoDataResponse(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, domain string) (int, error) {
+	response := new(dns.Msg)
+	response.SetReply(r)
+	if soa := g.zoneSOA(ctx, w, domain); soa != nil {
+		response.Authoritative = true
+		response.Ns = append(response.Ns, soa)
+	}
+	g.decorateWithECS(r, response, domain, true)
+
+	err := w.WriteMsg(response)
+	if err != nil {
+		log.Error("Failed to write DNS NODATA response: ", err)
+		IncRecordResolutions(domain, "fail")
+		return dns.RcodeServerFailure, err
+	}
+	IncRecordResolutions(domain, "success")
+	return dns.RcodeSuccess, nil
+}
+
+// zoneSOA returns the SOA of the zone owning domain, taken from the next plugin,
+// with the TTL capped at the SOA MINIMUM. Returns nil if it cannot be obtained.
+func (g *GSLB) zoneSOA(ctx context.Context, w dns.ResponseWriter, domain string) dns.RR {
+	if g.Next == nil {
+		return nil
+	}
+	zone := ""
+	for z := range g.Zones {
+		if (domain == z || strings.HasSuffix(domain, "."+z)) && len(z) > len(zone) {
+			zone = z
+		}
+	}
+	if zone == "" {
+		return nil
+	}
+	req := new(dns.Msg)
+	req.SetQuestion(zone, dns.TypeSOA)
+	nw := nonwriter.New(w)
+	if _, err := g.Next.ServeDNS(ctx, nw, req); err != nil || nw.Msg == nil {
+		return nil
+	}
+	for _, rr := range nw.Msg.Answer {
+		if soa, ok := rr.(*dns.SOA); ok {
+			c := dns.Copy(soa).(*dns.SOA)
+			if c.Minttl < c.Hdr.Ttl {
+				c.Hdr.Ttl = c.Minttl
+			}
+			return c
+		}
+	}
+	return nil
 }
 
 func (g *GSLB) decorateWithECS(r *dns.Msg, response *dns.Msg, domain string, forceGlobalScope bool) {

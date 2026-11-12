@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coredns/coredns/plugin"
 	"github.com/miekg/dns"
 	"github.com/oschwald/geoip2-golang"
 	"github.com/stretchr/testify/assert"
@@ -1041,17 +1042,36 @@ func TestCNAMEBackendResolution(t *testing.T) {
 
 type mockNextPlugin struct {
 	called bool
+	qtypes []uint16
 }
 
 func (n *mockNextPlugin) Name() string { return "mocknext" }
 
 func (n *mockNextPlugin) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 	n.called = true
+	n.qtypes = append(n.qtypes, r.Question[0].Qtype)
 	response := new(dns.Msg)
 	response.SetReply(r)
 
 	q := r.Question[0]
 	switch {
+	case q.Qtype == dns.TypeSOA:
+		soa := &dns.SOA{
+			Hdr: dns.RR_Header{
+				Name:   "example.org.",
+				Rrtype: dns.TypeSOA,
+				Class:  dns.ClassINET,
+				Ttl:    3600,
+			},
+			Ns:      "ns1.example.org.",
+			Mbox:    "hostmaster.example.org.",
+			Serial:  1,
+			Refresh: 7200,
+			Retry:   1800,
+			Expire:  259200,
+			Minttl:  300,
+		}
+		response.Answer = append(response.Answer, soa)
 	case q.Qtype == dns.TypeMX:
 		mx := &dns.MX{
 			Hdr: dns.RR_Header{
@@ -1296,11 +1316,12 @@ func TestServeDNS_FallthroughECSScopeMustBeZero(t *testing.T) {
 	//    Since the type is not configured/supported, it is a static NODATA response
 	//    and scope MUST be /0.
 	n.called = false
+	n.qtypes = nil
 	msgAAAA := makeECSQuery("registry.example.org.", dns.TypeAAAA)
 	wAAAA := &mockResponseWriter{msg: new(dns.Msg), ip: net.ParseIP("127.0.0.1")}
 	_, err = g.ServeDNS(context.Background(), wAAAA, msgAAAA)
 	assert.NoError(t, err)
-	assert.False(t, n.called, "AAAA should be handled by GSLB directly (returning NODATA)")
+	assert.NotContains(t, n.qtypes, dns.TypeAAAA, "AAAA should be handled by GSLB directly (returning NODATA)")
 
 	respEcsAAAA := getECS(wAAAA.msg)
 	assert.NotNil(t, respEcsAAAA, "AAAA response must have ECS")
@@ -1308,6 +1329,121 @@ func TestServeDNS_FallthroughECSScopeMustBeZero(t *testing.T) {
 		assert.Equal(t, uint8(0), respEcsAAAA.SourceScope,
 			"AAAA NODATA for A-only record must have scope /0")
 	}
+}
+
+// newNoDataTestGSLB returns a GSLB with a single IPv4-only record.
+func newNoDataTestGSLB(next plugin.Handler) *GSLB {
+	backend := &Backend{Address: "192.168.1.1", Enable: true, Alive: true, Priority: 1}
+	record := &Record{
+		Fqdn:      "app.example.org.",
+		Mode:      "failover",
+		Backends:  []BackendInterface{backend},
+		RecordTTL: 60,
+	}
+	g := &GSLB{
+		Zones:   map[string]string{"example.org.": "dummy.yml"},
+		Records: map[string]map[string]*Record{"example.org.": {"app.example.org.": record}},
+	}
+	if next != nil {
+		g.Next = next
+	}
+	return g
+}
+
+// TestServeDNS_NoDataIsAuthoritativeWithSOA: NODATA for an unconfigured type
+// has AA and the zone SOA, with the TTL capped at the SOA MINIMUM.
+func TestServeDNS_NoDataIsAuthoritativeWithSOA(t *testing.T) {
+	n := &mockNextPlugin{}
+	g := newNoDataTestGSLB(n)
+
+	for _, qtype := range []uint16{dns.TypeAAAA, dns.TypeCNAME} {
+		n.qtypes = nil
+		msg := new(dns.Msg)
+		msg.SetQuestion("app.example.org.", qtype)
+		w := &mockResponseWriter{msg: new(dns.Msg), ip: net.ParseIP("127.0.0.1")}
+
+		rcode, err := g.ServeDNS(context.Background(), w, msg)
+		assert.NoError(t, err)
+		assert.Equal(t, dns.RcodeSuccess, rcode)
+		assert.Equal(t, dns.RcodeSuccess, w.msg.Rcode)
+		assert.Empty(t, w.msg.Answer, "NODATA must not carry answers")
+		assert.True(t, w.msg.Authoritative, "NODATA must be authoritative")
+		assert.Equal(t, "app.example.org.", w.msg.Question[0].Name)
+		assert.Equal(t, qtype, w.msg.Question[0].Qtype)
+
+		if assert.Len(t, w.msg.Ns, 1, "NODATA must carry the zone SOA in the authority section") {
+			soa, ok := w.msg.Ns[0].(*dns.SOA)
+			if assert.True(t, ok, "authority record must be a SOA") {
+				assert.Equal(t, "example.org.", soa.Hdr.Name)
+				assert.Equal(t, uint32(300), soa.Hdr.Ttl, "SOA TTL must be capped at the SOA MINIMUM")
+			}
+		}
+		assert.Equal(t, []uint16{dns.TypeSOA}, n.qtypes, "the next plugin must only be asked for the zone SOA")
+	}
+
+	// A is unaffected.
+	msgA := new(dns.Msg)
+	msgA.SetQuestion("app.example.org.", dns.TypeA)
+	wA := &mockResponseWriter{msg: new(dns.Msg), ip: net.ParseIP("127.0.0.1")}
+	_, err := g.ServeDNS(context.Background(), wA, msgA)
+	assert.NoError(t, err)
+	assert.Len(t, wA.msg.Answer, 1)
+	assert.Empty(t, wA.msg.Ns)
+}
+
+// TestServeDNS_NoDataWithoutSOA: without a SOA from the next plugin, NODATA
+// stays a bare NOERROR.
+func TestServeDNS_NoDataWithoutSOA(t *testing.T) {
+	cases := map[string]plugin.Handler{
+		"no next plugin":            nil,
+		"next plugin without a SOA": &nextPlugin{},
+	}
+	for name, next := range cases {
+		t.Run(name, func(t *testing.T) {
+			g := newNoDataTestGSLB(next)
+			msg := new(dns.Msg)
+			msg.SetQuestion("app.example.org.", dns.TypeAAAA)
+			w := &mockResponseWriter{msg: new(dns.Msg), ip: net.ParseIP("127.0.0.1")}
+
+			rcode, err := g.ServeDNS(context.Background(), w, msg)
+			assert.NoError(t, err)
+			assert.Equal(t, dns.RcodeSuccess, rcode)
+			assert.Equal(t, dns.RcodeSuccess, w.msg.Rcode)
+			assert.Empty(t, w.msg.Answer)
+			assert.Empty(t, w.msg.Ns)
+			assert.False(t, w.msg.Authoritative)
+		})
+	}
+}
+
+// TestServeDNS_FailClosedHasNoSOA: fail-closed answers get no SOA, so they are
+// not negatively cached.
+func TestServeDNS_FailClosedHasNoSOA(t *testing.T) {
+	backend := &MockBackend{Backend: &Backend{Address: "192.168.1.1", Enable: true}}
+	backend.On("IsHealthy").Return(false)
+
+	n := &mockNextPlugin{}
+	g := &GSLB{
+		Zones: map[string]string{"example.org.": "dummy.yml"},
+		Records: map[string]map[string]*Record{"example.org.": {"down.example.org.": {
+			Fqdn:           "down.example.org.",
+			Mode:           "failover",
+			Backends:       []BackendInterface{backend},
+			RecordTTL:      60,
+			FallbackPolicy: FallbackPolicy{Mode: "fail-closed", Rcode: "NOERROR"},
+		}}},
+		Next: n,
+	}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("down.example.org.", dns.TypeA)
+	w := &mockResponseWriter{msg: new(dns.Msg), ip: net.ParseIP("127.0.0.1")}
+	_, err := g.ServeDNS(context.Background(), w, msg)
+	assert.NoError(t, err)
+	assert.Equal(t, dns.RcodeSuccess, w.msg.Rcode)
+	assert.Empty(t, w.msg.Answer)
+	assert.Empty(t, w.msg.Ns, "fail-closed answers must not be negatively cacheable")
+	assert.Empty(t, n.qtypes, "fail-closed must not query the next plugin")
 }
 
 func TestGSLB_ServeDNS_Concurrency(t *testing.T) {
